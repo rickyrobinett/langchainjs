@@ -6,6 +6,7 @@ lib/
 .eslintcache
 .env
 yarn-error.log
+docs/_dist/
 
 .yarn/*
 !.yarn/patches
@@ -24,3 +25,10 @@ Chinook.db
 Chinook_Sqlite.sql
 
 .envrc
+*.swp
+*.swo
+
+.node-version
+
+firebase-debug.log
+firestore-debug.log

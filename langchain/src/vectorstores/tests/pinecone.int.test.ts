@@ -3,7 +3,7 @@
 import { beforeEach, describe, expect, test } from "@jest/globals";
 import { faker } from "@faker-js/faker";
 import { PineconeClient } from "@pinecone-database/pinecone";
-import { v4 as uuidv4 } from "uuid";
+import * as uuid from "uuid";
 import { Document } from "../../document.js";
 import { OpenAIEmbeddings } from "../../embeddings/openai.js";
 import { PineconeStore } from "../pinecone.js";
@@ -25,7 +25,7 @@ describe("PineconeStore", () => {
   });
 
   test("user-provided ids", async () => {
-    const documentId = uuidv4();
+    const documentId = uuid.v4();
     const pageContent = faker.lorem.sentence(5);
 
     await pineconeStore.addDocuments(
@@ -36,6 +36,17 @@ describe("PineconeStore", () => {
     const results = await pineconeStore.similaritySearch(pageContent, 1);
 
     expect(results).toEqual([new Document({ metadata: {}, pageContent })]);
+
+    await pineconeStore.addDocuments(
+      [{ pageContent: `${pageContent} upserted`, metadata: {} }],
+      [documentId]
+    );
+
+    const results2 = await pineconeStore.similaritySearch(pageContent, 1);
+
+    expect(results2).toEqual([
+      new Document({ metadata: {}, pageContent: `${pageContent} upserted` }),
+    ]);
   });
 
   test("auto-generated ids", async () => {
@@ -54,21 +65,73 @@ describe("PineconeStore", () => {
 
   test("metadata filtering", async () => {
     const pageContent = faker.lorem.sentence(5);
-    const uuid = uuidv4();
+    const id = uuid.v4();
 
     await pineconeStore.addDocuments([
       { pageContent, metadata: { foo: "bar" } },
-      { pageContent, metadata: { foo: uuid } },
+      { pageContent, metadata: { foo: id } },
       { pageContent, metadata: { foo: "qux" } },
     ]);
 
     // If the filter wasn't working, we'd get all 3 documents back
     const results = await pineconeStore.similaritySearch(pageContent, 3, {
-      foo: uuid,
+      foo: id,
     });
 
     expect(results).toEqual([
-      new Document({ metadata: { foo: uuid }, pageContent }),
+      new Document({ metadata: { foo: id }, pageContent }),
     ]);
+  });
+
+  test("delete by id", async () => {
+    const pageContent = faker.lorem.sentence(5);
+    const id = uuid.v4();
+
+    const ids = await pineconeStore.addDocuments([
+      { pageContent, metadata: { foo: id } },
+      { pageContent, metadata: { foo: id } },
+    ]);
+
+    const results = await pineconeStore.similaritySearch(pageContent, 2, {
+      foo: id,
+    });
+
+    expect(results.length).toEqual(2);
+
+    await pineconeStore.delete({
+      ids: ids.slice(0, 1),
+    });
+
+    const results2 = await pineconeStore.similaritySearch(pageContent, 2, {
+      foo: id,
+    });
+
+    expect(results2.length).toEqual(1);
+  });
+
+  test("delete all", async () => {
+    const pageContent = faker.lorem.sentence(5);
+    const id = uuid.v4();
+
+    await pineconeStore.addDocuments([
+      { pageContent, metadata: { foo: id } },
+      { pageContent, metadata: { foo: id } },
+    ]);
+
+    const results = await pineconeStore.similaritySearch(pageContent, 2, {
+      foo: id,
+    });
+
+    expect(results.length).toEqual(2);
+
+    await pineconeStore.delete({
+      deleteAll: true,
+    });
+
+    const results2 = await pineconeStore.similaritySearch(pageContent, 2, {
+      foo: id,
+    });
+
+    expect(results2.length).toEqual(0);
   });
 });

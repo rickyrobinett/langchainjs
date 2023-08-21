@@ -1,4 +1,4 @@
-import { TiktokenModel } from "@dqbd/tiktoken";
+import type { TiktokenModel } from "js-tiktoken/lite";
 import {
   Configuration,
   ConfigurationParameters,
@@ -7,91 +7,34 @@ import {
   CreateCompletionResponseChoicesInner,
   OpenAIApi,
 } from "openai";
-import type { AxiosRequestConfig } from "axios";
+import { calculateMaxTokens } from "../base_language/count_tokens.js";
+import { CallbackManagerForLLMRun } from "../callbacks/manager.js";
+import { GenerationChunk, LLMResult } from "../schema/index.js";
+import {
+  AzureOpenAIInput,
+  OpenAICallOptions,
+  OpenAIInput,
+} from "../types/openai-types.js";
 import fetchAdapter from "../util/axios-fetch-adapter.js";
 import type { StreamingAxiosConfiguration } from "../util/axios-types.js";
+import { OpenAIEndpointConfig, getEndpoint } from "../util/azure.js";
 import { chunkArray } from "../util/chunk.js";
-import { BaseLLM, BaseLLMCallOptions, BaseLLMParams } from "./base.js";
-import { calculateMaxTokens } from "../base_language/count_tokens.js";
+import { getEnvironmentVariable, isNode } from "../util/env.js";
+import { promptLayerTrackRequest } from "../util/prompt-layer.js";
+import { readableStreamToAsyncIterable } from "../util/stream.js";
+import { BaseLLM, BaseLLMParams } from "./base.js";
 import { OpenAIChat } from "./openai-chat.js";
-import { LLMResult } from "../schema/index.js";
-import { CallbackManagerForLLMRun } from "../callbacks/manager.js";
+
+export { AzureOpenAIInput, OpenAICallOptions, OpenAIInput };
 
 /**
- * Input to OpenAI class.
+ * Interface for tracking token usage in OpenAI calls.
  */
-export interface OpenAIInput {
-  /** Sampling temperature to use */
-  temperature: number;
-
-  /**
-   * Maximum number of tokens to generate in the completion. -1 returns as many
-   * tokens as possible given the prompt and the model's maximum context size.
-   */
-  maxTokens: number;
-
-  /** Total probability mass of tokens to consider at each step */
-  topP: number;
-
-  /** Penalizes repeated tokens according to frequency */
-  frequencyPenalty: number;
-
-  /** Penalizes repeated tokens */
-  presencePenalty: number;
-
-  /** Number of completions to generate for each prompt */
-  n: number;
-
-  /** Generates `bestOf` completions server side and returns the "best" */
-  bestOf: number;
-
-  /** Dictionary used to adjust the probability of specific tokens being generated */
-  logitBias?: Record<string, number>;
-
-  /** Whether to stream the results or not. Enabling disables tokenUsage reporting */
-  streaming: boolean;
-
-  /** Model name to use */
-  modelName: string;
-
-  /** Holds any additional parameters that are valid to pass to {@link
-   * https://platform.openai.com/docs/api-reference/completions/create |
-   * `openai.createCompletion`} that are not explicitly specified on this class.
-   */
-  modelKwargs?: Kwargs;
-
-  /** Batch size to use when passing multiple documents to generate */
-  batchSize: number;
-
-  /** List of stop words to use when generating */
-  stop?: string[];
-
-  /**
-   * Timeout to use when making requests to OpenAI.
-   */
-  timeout?: number;
-}
-
-export interface OpenAICallOptions extends BaseLLMCallOptions {
-  /**
-   * List of stop words to use when generating
-   */
-  stop?: string[];
-
-  /**
-   * Additional options to pass to the underlying axios request.
-   */
-  options?: AxiosRequestConfig;
-}
-
 interface TokenUsage {
   completionTokens?: number;
   promptTokens?: number;
   totalTokens?: number;
 }
-
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-type Kwargs = Record<string, any>;
 
 /**
  * Wrapper around OpenAI large language models.
@@ -99,14 +42,50 @@ type Kwargs = Record<string, any>;
  * To use you should have the `openai` package installed, with the
  * `OPENAI_API_KEY` environment variable set.
  *
+ * To use with Azure you should have the `openai` package installed, with the
+ * `AZURE_OPENAI_API_KEY`,
+ * `AZURE_OPENAI_API_INSTANCE_NAME`,
+ * `AZURE_OPENAI_API_DEPLOYMENT_NAME`
+ * and `AZURE_OPENAI_API_VERSION` environment variable set.
+ *
  * @remarks
  * Any parameters that are valid to be passed to {@link
  * https://platform.openai.com/docs/api-reference/completions/create |
  * `openai.createCompletion`} can be passed through {@link modelKwargs}, even
  * if not explicitly available on this class.
  */
-export class OpenAI extends BaseLLM implements OpenAIInput {
-  declare CallOptions: OpenAICallOptions;
+export class OpenAI
+  extends BaseLLM<OpenAICallOptions>
+  implements OpenAIInput, AzureOpenAIInput
+{
+  static lc_name() {
+    return "OpenAI";
+  }
+
+  get callKeys(): (keyof OpenAICallOptions)[] {
+    return [...(super.callKeys as (keyof OpenAICallOptions)[]), "options"];
+  }
+
+  lc_serializable = true;
+
+  get lc_secrets(): { [key: string]: string } | undefined {
+    return {
+      openAIApiKey: "OPENAI_API_KEY",
+      azureOpenAIApiKey: "AZURE_OPENAI_API_KEY",
+      organization: "OPENAI_ORGANIZATION",
+    };
+  }
+
+  get lc_aliases(): Record<string, string> {
+    return {
+      modelName: "model",
+      openAIApiKey: "openai_api_key",
+      azureOpenAIApiVersion: "azure_openai_api_version",
+      azureOpenAIApiKey: "azure_openai_api_key",
+      azureOpenAIApiInstanceName: "azure_openai_api_instance_name",
+      azureOpenAIApiDeploymentName: "azure_openai_api_deployment_name",
+    };
+  }
 
   temperature = 0.7;
 
@@ -120,13 +99,13 @@ export class OpenAI extends BaseLLM implements OpenAIInput {
 
   n = 1;
 
-  bestOf = 1;
+  bestOf?: number;
 
   logitBias?: Record<string, number>;
 
   modelName = "text-davinci-003";
 
-  modelKwargs?: Kwargs;
+  modelKwargs?: OpenAIInput["modelKwargs"];
 
   batchSize = 20;
 
@@ -134,7 +113,23 @@ export class OpenAI extends BaseLLM implements OpenAIInput {
 
   stop?: string[];
 
+  user?: string;
+
   streaming = false;
+
+  openAIApiKey?: string;
+
+  azureOpenAIApiVersion?: string;
+
+  azureOpenAIApiKey?: string;
+
+  azureOpenAIApiInstanceName?: string;
+
+  azureOpenAIApiDeploymentName?: string;
+
+  azureOpenAIBasePath?: string;
+
+  organization?: string;
 
   private client: OpenAIApi;
 
@@ -142,29 +137,55 @@ export class OpenAI extends BaseLLM implements OpenAIInput {
 
   constructor(
     fields?: Partial<OpenAIInput> &
+      Partial<AzureOpenAIInput> &
       BaseLLMParams & {
-        openAIApiKey?: string;
+        configuration?: ConfigurationParameters;
       },
+    /** @deprecated */
     configuration?: ConfigurationParameters
   ) {
     if (
       fields?.modelName?.startsWith("gpt-3.5-turbo") ||
-      fields?.modelName?.startsWith("gpt-4")
+      fields?.modelName?.startsWith("gpt-4") ||
+      fields?.modelName?.startsWith("gpt-4-32k")
     ) {
       // eslint-disable-next-line no-constructor-return, @typescript-eslint/no-explicit-any
       return new OpenAIChat(fields, configuration) as any as OpenAI;
     }
     super(fields ?? {});
 
-    const apiKey =
-      fields?.openAIApiKey ??
-      (typeof process !== "undefined"
-        ? // eslint-disable-next-line no-process-env
-          process.env?.OPENAI_API_KEY
-        : undefined);
-    if (!apiKey) {
-      throw new Error("OpenAI API key not found");
+    this.openAIApiKey =
+      fields?.openAIApiKey ?? getEnvironmentVariable("OPENAI_API_KEY");
+
+    this.azureOpenAIApiKey =
+      fields?.azureOpenAIApiKey ??
+      getEnvironmentVariable("AZURE_OPENAI_API_KEY");
+
+    if (!this.azureOpenAIApiKey && !this.openAIApiKey) {
+      throw new Error("OpenAI or Azure OpenAI API key not found");
     }
+
+    this.azureOpenAIApiInstanceName =
+      fields?.azureOpenAIApiInstanceName ??
+      getEnvironmentVariable("AZURE_OPENAI_API_INSTANCE_NAME");
+
+    this.azureOpenAIApiDeploymentName =
+      (fields?.azureOpenAIApiCompletionsDeploymentName ||
+        fields?.azureOpenAIApiDeploymentName) ??
+      (getEnvironmentVariable("AZURE_OPENAI_API_COMPLETIONS_DEPLOYMENT_NAME") ||
+        getEnvironmentVariable("AZURE_OPENAI_API_DEPLOYMENT_NAME"));
+
+    this.azureOpenAIApiVersion =
+      fields?.azureOpenAIApiVersion ??
+      getEnvironmentVariable("AZURE_OPENAI_API_VERSION");
+
+    this.azureOpenAIBasePath =
+      fields?.azureOpenAIBasePath ??
+      getEnvironmentVariable("AZURE_OPENAI_BASE_PATH");
+
+    this.organization =
+      fields?.configuration?.organization ??
+      getEnvironmentVariable("OPENAI_ORGANIZATION");
 
     this.modelName = fields?.modelName ?? this.modelName;
     this.modelKwargs = fields?.modelKwargs ?? {};
@@ -180,27 +201,40 @@ export class OpenAI extends BaseLLM implements OpenAIInput {
     this.bestOf = fields?.bestOf ?? this.bestOf;
     this.logitBias = fields?.logitBias;
     this.stop = fields?.stop;
+    this.user = fields?.user;
 
     this.streaming = fields?.streaming ?? false;
 
-    if (this.streaming && this.n > 1) {
-      throw new Error("Cannot stream results when n > 1");
-    }
-
-    if (this.streaming && this.bestOf > 1) {
+    if (this.streaming && this.bestOf && this.bestOf > 1) {
       throw new Error("Cannot stream results when bestOf > 1");
     }
 
+    if (this.azureOpenAIApiKey) {
+      if (!this.azureOpenAIApiInstanceName && !this.azureOpenAIBasePath) {
+        throw new Error("Azure OpenAI API instance name not found");
+      }
+      if (!this.azureOpenAIApiDeploymentName) {
+        throw new Error("Azure OpenAI API deployment name not found");
+      }
+      if (!this.azureOpenAIApiVersion) {
+        throw new Error("Azure OpenAI API version not found");
+      }
+    }
+
     this.clientConfig = {
-      apiKey,
+      apiKey: this.openAIApiKey,
+      organization: this.organization,
       ...configuration,
+      ...fields?.configuration,
     };
   }
 
   /**
    * Get the parameters used to invoke the model
    */
-  invocationParams(): CreateCompletionRequest & Kwargs {
+  invocationParams(
+    options?: this["ParsedCallOptions"]
+  ): CreateCompletionRequest {
     return {
       model: this.modelName,
       temperature: this.temperature,
@@ -211,7 +245,8 @@ export class OpenAI extends BaseLLM implements OpenAIInput {
       n: this.n,
       best_of: this.bestOf,
       logit_bias: this.logitBias,
-      stop: this.stop,
+      stop: options?.stop ?? this.stop,
+      user: this.user,
       stream: this.streaming,
       ...this.modelKwargs,
     };
@@ -235,8 +270,8 @@ export class OpenAI extends BaseLLM implements OpenAIInput {
   /**
    * Call out to OpenAI's endpoint with k unique prompts
    *
-   * @param prompts - The prompts to pass into the model.
-   * @param [stop] - Optional list of stop words to use when generating.
+   * @param [prompts] - The prompts to pass into the model.
+   * @param [options] - Optional list of stop words to use when generating.
    * @param [runManager] - Optional callback manager to use when generating.
    *
    * @returns The full LLM output.
@@ -250,25 +285,14 @@ export class OpenAI extends BaseLLM implements OpenAIInput {
    */
   async _generate(
     prompts: string[],
-    stopOrOptions?: string[] | this["CallOptions"],
+    options: this["ParsedCallOptions"],
     runManager?: CallbackManagerForLLMRun
   ): Promise<LLMResult> {
-    const stop = Array.isArray(stopOrOptions)
-      ? stopOrOptions
-      : stopOrOptions?.stop;
-    const options = Array.isArray(stopOrOptions)
-      ? {}
-      : stopOrOptions?.options ?? {};
     const subPrompts = chunkArray(prompts, this.batchSize);
     const choices: CreateCompletionResponseChoicesInner[] = [];
     const tokenUsage: TokenUsage = {};
 
-    if (this.stop && stop) {
-      throw new Error("Stop found in input and default params");
-    }
-
-    const params = this.invocationParams();
-    params.stop = stop ?? params.stop;
+    const params = this.invocationParams(options);
 
     if (params.max_tokens === -1) {
       if (prompts.length !== 1) {
@@ -286,25 +310,43 @@ export class OpenAI extends BaseLLM implements OpenAIInput {
     for (let i = 0; i < subPrompts.length; i += 1) {
       const data = params.stream
         ? await new Promise<CreateCompletionResponse>((resolve, reject) => {
-            const choice: CreateCompletionResponseChoicesInner = {};
+            const choices: CreateCompletionResponseChoicesInner[] = [];
             let response: Omit<CreateCompletionResponse, "choices">;
             let rejected = false;
+            let resolved = false;
             this.completionWithRetry(
               {
                 ...params,
                 prompt: subPrompts[i],
               },
               {
-                ...options,
+                signal: options.signal,
+                ...options.options,
+                adapter: fetchAdapter, // default adapter doesn't do streaming
                 responseType: "stream",
                 onmessage: (event) => {
                   if (event.data?.trim?.() === "[DONE]") {
+                    if (resolved || rejected) {
+                      return;
+                    }
+                    resolved = true;
                     resolve({
                       ...response,
-                      choices: [choice],
+                      choices,
                     });
                   } else {
-                    const message = JSON.parse(event.data) as Omit<
+                    const data = JSON.parse(event.data);
+
+                    if (data?.error) {
+                      if (rejected) {
+                        return;
+                      }
+                      rejected = true;
+                      reject(data.error);
+                      return;
+                    }
+
+                    const message = data as Omit<
                       CreateCompletionResponse,
                       "usage"
                     >;
@@ -320,13 +362,32 @@ export class OpenAI extends BaseLLM implements OpenAIInput {
                     }
 
                     // on all messages, update choice
-                    const part = message.choices[0];
-                    if (part != null) {
-                      choice.text = (choice.text ?? "") + (part.text ?? "");
-                      choice.finish_reason = part.finish_reason;
-                      choice.logprobs = part.logprobs;
-                      // eslint-disable-next-line no-void
-                      void runManager?.handleLLMNewToken(part.text ?? "");
+                    for (const part of message.choices) {
+                      if (part != null && part.index != null) {
+                        if (!choices[part.index]) choices[part.index] = {};
+                        const choice = choices[part.index];
+                        choice.text = (choice.text ?? "") + (part.text ?? "");
+                        choice.finish_reason = part.finish_reason;
+                        choice.logprobs = part.logprobs;
+                        // eslint-disable-next-line no-void
+                        void runManager?.handleLLMNewToken(part.text ?? "", {
+                          prompt: Math.floor(part.index / this.n),
+                          completion: part.index % this.n,
+                        });
+                      }
+                    }
+
+                    // when all messages are finished, resolve
+                    if (
+                      !resolved &&
+                      !rejected &&
+                      choices.every((c) => c.finish_reason != null)
+                    ) {
+                      resolved = true;
+                      resolve({
+                        ...response,
+                        choices,
+                      });
                     }
                   }
                 },
@@ -343,7 +404,10 @@ export class OpenAI extends BaseLLM implements OpenAIInput {
               ...params,
               prompt: subPrompts[i],
             },
-            options
+            {
+              signal: options.signal,
+              ...options.options,
+            }
           );
 
       choices.push(...data.choices);
@@ -383,24 +447,137 @@ export class OpenAI extends BaseLLM implements OpenAIInput {
     };
   }
 
+  // TODO(jacoblee): Refactor with _generate(..., {stream: true}) implementation
+  // when we integrate OpenAI's new SDK.
+  async *_streamResponseChunks(
+    input: string,
+    options: this["ParsedCallOptions"],
+    runManager?: CallbackManagerForLLMRun
+  ): AsyncGenerator<GenerationChunk> {
+    const params = {
+      ...this.invocationParams(options),
+      prompt: input,
+      stream: true,
+    };
+    const streamIterable = this.startStream(params, options);
+    for await (const streamedResponse of streamIterable) {
+      const data = JSON.parse(streamedResponse);
+      const choice = data.choices?.[0];
+      if (!choice) {
+        continue;
+      }
+      const chunk = new GenerationChunk({
+        text: choice.text,
+        generationInfo: {
+          finishReason: choice.finish_reason,
+          logprobs: choice.logprobs,
+        },
+      });
+      yield chunk;
+      // eslint-disable-next-line no-void
+      void runManager?.handleLLMNewToken(chunk.text ?? "");
+    }
+  }
+
+  startStream(
+    request: CreateCompletionRequest,
+    options?: StreamingAxiosConfiguration
+  ) {
+    let done = false;
+    const stream = new TransformStream();
+    const writer = stream.writable.getWriter();
+    const iterable = readableStreamToAsyncIterable(stream.readable);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let err: any;
+    this.completionWithRetry(request, {
+      ...options,
+      adapter: fetchAdapter, // default adapter doesn't do streaming
+      responseType: "stream",
+      onmessage: (event) => {
+        if (done) return;
+        if (event.data?.trim?.() === "[DONE]") {
+          done = true;
+          // eslint-disable-next-line no-void
+          void writer.close();
+        } else {
+          const data = JSON.parse(event.data);
+          if (data.error) {
+            done = true;
+            throw data.error;
+          }
+          // eslint-disable-next-line no-void
+          void writer.write(event.data);
+        }
+      },
+    }).catch((error) => {
+      if (!done) {
+        err = error;
+        done = true;
+        // eslint-disable-next-line no-void
+        void writer.close();
+      }
+    });
+    return {
+      async next() {
+        const chunk = await iterable.next();
+        if (err) {
+          throw err;
+        }
+        return chunk;
+      },
+      [Symbol.asyncIterator]() {
+        return this;
+      },
+    };
+  }
+
   /** @ignore */
   async completionWithRetry(
     request: CreateCompletionRequest,
     options?: StreamingAxiosConfiguration
   ) {
     if (!this.client) {
+      const openAIEndpointConfig: OpenAIEndpointConfig = {
+        azureOpenAIApiDeploymentName: this.azureOpenAIApiDeploymentName,
+        azureOpenAIApiInstanceName: this.azureOpenAIApiInstanceName,
+        azureOpenAIApiKey: this.azureOpenAIApiKey,
+        azureOpenAIBasePath: this.azureOpenAIBasePath,
+        basePath: this.clientConfig.basePath,
+      };
+
+      const endpoint = getEndpoint(openAIEndpointConfig);
+
       const clientConfig = new Configuration({
         ...this.clientConfig,
+        basePath: endpoint,
         baseOptions: {
           timeout: this.timeout,
-          adapter: fetchAdapter,
           ...this.clientConfig.baseOptions,
         },
       });
       this.client = new OpenAIApi(clientConfig);
     }
+    const axiosOptions: StreamingAxiosConfiguration = {
+      adapter: isNode() ? undefined : fetchAdapter,
+      ...this.clientConfig.baseOptions,
+      ...options,
+    };
+    if (this.azureOpenAIApiKey) {
+      axiosOptions.headers = {
+        "api-key": this.azureOpenAIApiKey,
+        ...axiosOptions.headers,
+      };
+      axiosOptions.params = {
+        "api-version": this.azureOpenAIApiVersion,
+        ...axiosOptions.params,
+      };
+    }
     return this.caller
-      .call(this.client.createCompletion.bind(this.client), request, options)
+      .call(
+        this.client.createCompletion.bind(this.client),
+        request,
+        axiosOptions
+      )
       .then((res) => res.data);
   }
 
@@ -414,14 +591,25 @@ export class OpenAI extends BaseLLM implements OpenAIInput {
  * @augments OpenAI
  */
 export class PromptLayerOpenAI extends OpenAI {
+  get lc_secrets(): { [key: string]: string } | undefined {
+    return {
+      promptLayerApiKey: "PROMPTLAYER_API_KEY",
+    };
+  }
+
+  lc_serializable = false;
+
   promptLayerApiKey?: string;
 
   plTags?: string[];
+
+  returnPromptLayerId?: boolean;
 
   constructor(
     fields?: ConstructorParameters<typeof OpenAI>[0] & {
       promptLayerApiKey?: string;
       plTags?: string[];
+      returnPromptLayerId?: boolean;
     }
   ) {
     super(fields);
@@ -429,16 +617,20 @@ export class PromptLayerOpenAI extends OpenAI {
     this.plTags = fields?.plTags ?? [];
     this.promptLayerApiKey =
       fields?.promptLayerApiKey ??
-      (typeof process !== "undefined"
-        ? // eslint-disable-next-line no-process-env
-          process.env?.PROMPTLAYER_API_KEY
-        : undefined);
+      getEnvironmentVariable("PROMPTLAYER_API_KEY");
 
+    this.returnPromptLayerId = fields?.returnPromptLayerId;
     if (!this.promptLayerApiKey) {
       throw new Error("Missing PromptLayer API key");
     }
   }
 
+  /**
+   * Calls the OpenAI API with retry logic in case of failures.
+   * @param request The request to send to the OpenAI API.
+   * @param options Optional configuration for the API call.
+   * @returns The response from the OpenAI API.
+   */
   async completionWithRetry(
     request: CreateCompletionRequest,
     options?: StreamingAxiosConfiguration
@@ -447,35 +639,53 @@ export class PromptLayerOpenAI extends OpenAI {
       return super.completionWithRetry(request, options);
     }
 
-    const requestStartTime = Date.now();
     const response = await super.completionWithRetry(request);
-    const requestEndTime = Date.now();
-
-    // https://github.com/MagnivOrg/promptlayer-js-helper
-    await this.caller.call(fetch, "https://api.promptlayer.com/track-request", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Accept: "application/json",
-      },
-      body: JSON.stringify({
-        function_name: "openai.Completion.create",
-        args: [],
-        kwargs: { engine: request.model, prompt: request.prompt },
-        tags: this.plTags ?? [],
-        request_response: response,
-        request_start_time: Math.floor(requestStartTime / 1000),
-        request_end_time: Math.floor(requestEndTime / 1000),
-        api_key: this.promptLayerApiKey,
-      }),
-    });
 
     return response;
   }
+
+  async _generate(
+    prompts: string[],
+    options: this["ParsedCallOptions"],
+    runManager?: CallbackManagerForLLMRun
+  ): Promise<LLMResult> {
+    const requestStartTime = Date.now();
+    const generations = await super._generate(prompts, options, runManager);
+
+    for (let i = 0; i < generations.generations.length; i += 1) {
+      const requestEndTime = Date.now();
+      const parsedResp = {
+        text: generations.generations[i][0].text,
+        llm_output: generations.llmOutput,
+      };
+
+      const promptLayerRespBody = await promptLayerTrackRequest(
+        this.caller,
+        "langchain.PromptLayerOpenAI",
+        [prompts[i]],
+        this._identifyingParams(),
+        this.plTags,
+        parsedResp,
+        requestStartTime,
+        requestEndTime,
+        this.promptLayerApiKey
+      );
+
+      let promptLayerRequestId;
+      if (this.returnPromptLayerId === true) {
+        if (promptLayerRespBody && promptLayerRespBody.success === true) {
+          promptLayerRequestId = promptLayerRespBody.request_id;
+        }
+
+        generations.generations[i][0].generationInfo = {
+          ...generations.generations[i][0].generationInfo,
+          promptLayerRequestId,
+        };
+      }
+    }
+
+    return generations;
+  }
 }
 
-export {
-  OpenAIChat,
-  OpenAIChatInput,
-  OpenAIChatCallOptions,
-} from "./openai-chat.js";
+export { OpenAIChat, PromptLayerOpenAIChat } from "./openai-chat.js";

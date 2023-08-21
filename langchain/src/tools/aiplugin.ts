@@ -1,12 +1,24 @@
-import { Tool } from "./base.js";
+import { Tool, ToolParams } from "./base.js";
 
-export interface AIPluginToolParams {
+/**
+ * Interface for parameters required to create an instance of
+ * AIPluginTool.
+ */
+export interface AIPluginToolParams extends ToolParams {
   name: string;
   description: string;
   apiSpec: string;
 }
 
+/**
+ * Class for creating instances of AI tools from plugins. It extends the
+ * Tool class and implements the AIPluginToolParams interface.
+ */
 export class AIPluginTool extends Tool implements AIPluginToolParams {
+  static lc_name() {
+    return "AIPluginTool";
+  }
+
   private _name: string;
 
   private _description: string;
@@ -22,7 +34,7 @@ export class AIPluginTool extends Tool implements AIPluginToolParams {
   }
 
   constructor(params: AIPluginToolParams) {
-    super();
+    super(params);
     this._name = params.name;
     this._description = params.description;
     this.apiSpec = params.apiSpec;
@@ -33,6 +45,14 @@ export class AIPluginTool extends Tool implements AIPluginToolParams {
     return this.apiSpec;
   }
 
+  /**
+   * Static method that creates an instance of AIPluginTool from a given
+   * plugin URL. It fetches the plugin and its API specification from the
+   * provided URL and returns a new instance of AIPluginTool with the
+   * fetched data.
+   * @param url The URL of the AI plugin.
+   * @returns A new instance of AIPluginTool.
+   */
   static async fromPluginUrl(url: string) {
     const aiPluginRes = await fetch(url);
     if (!aiPluginRes.ok) {
@@ -55,7 +75,7 @@ export class AIPluginTool extends Tool implements AIPluginToolParams {
       description: `Call this tool to get the OpenAPI spec (and usage guide) for interacting with the ${aiPluginJson.name_for_human} API. You should only call this ONCE! What is the ${aiPluginJson.name_for_human} API useful for? ${aiPluginJson.description_for_human}`,
       apiSpec: `Usage Guide: ${aiPluginJson.description_for_model}
 
-OpenAPI Spec: ${apiUrlJson}`,
+OpenAPI Spec in JSON or YAML format:\n${apiUrlJson}`,
     });
   }
 }

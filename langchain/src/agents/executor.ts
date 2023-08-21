@@ -1,6 +1,5 @@
 import { BaseChain, ChainInputs } from "../chains/base.js";
 import { BaseMultiActionAgent, BaseSingleActionAgent } from "./agent.js";
-import { Tool } from "../tools/base.js";
 import { StoppingMethod } from "./types.js";
 import { SerializedLLMChain } from "../chains/serde.js";
 import {
@@ -11,9 +10,14 @@ import {
 } from "../schema/index.js";
 import { CallbackManagerForChainRun } from "../callbacks/manager.js";
 
+/**
+ * Interface defining the structure of input data for creating an
+ * AgentExecutor. It extends ChainInputs and includes additional
+ * properties specific to agent execution.
+ */
 export interface AgentExecutorInput extends ChainInputs {
   agent: BaseSingleActionAgent | BaseMultiActionAgent;
-  tools: Tool[];
+  tools: this["agent"]["ToolType"][];
   returnIntermediateSteps?: boolean;
   maxIterations?: number;
   earlyStoppingMethod?: StoppingMethod;
@@ -24,9 +28,17 @@ export interface AgentExecutorInput extends ChainInputs {
  * @augments BaseChain
  */
 export class AgentExecutor extends BaseChain {
+  static lc_name() {
+    return "AgentExecutor";
+  }
+
+  get lc_namespace() {
+    return ["langchain", "agents", "executor"];
+  }
+
   agent: BaseSingleActionAgent | BaseMultiActionAgent;
 
-  tools: Tool[];
+  tools: this["agent"]["ToolType"][];
 
   returnIntermediateSteps = false;
 
@@ -43,11 +55,7 @@ export class AgentExecutor extends BaseChain {
   }
 
   constructor(input: AgentExecutorInput) {
-    super(
-      input.memory,
-      input.verbose,
-      input.callbacks ?? input.callbackManager
-    );
+    super(input);
     this.agent = input.agent;
     this.tools = input.tools;
     if (this.agent._agentActionType() === "multi") {
@@ -71,6 +79,12 @@ export class AgentExecutor extends BaseChain {
     return new AgentExecutor(fields);
   }
 
+  /**
+   * Method that checks if the agent execution should continue based on the
+   * number of iterations.
+   * @param iterations The current number of iterations.
+   * @returns A boolean indicating whether the agent execution should continue.
+   */
   private shouldContinue(iterations: number): boolean {
     return this.maxIterations === undefined || iterations < this.maxIterations;
   }

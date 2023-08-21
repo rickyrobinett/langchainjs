@@ -1,25 +1,133 @@
 import type { basename as BasenameT } from "node:path";
-import type { readFile as ReaFileT } from "node:fs/promises";
-import { DirectoryLoader, UnknownHandling } from "./directory.js";
+import type { readFile as ReadFileT } from "node:fs/promises";
+import {
+  DirectoryLoader,
+  UnknownHandling,
+  LoadersMapping,
+} from "./directory.js";
 import { getEnv } from "../../util/env.js";
 import { Document } from "../../document.js";
 import { BaseDocumentLoader } from "../base.js";
 
-interface Element {
+const UNSTRUCTURED_API_FILETYPES = [
+  ".txt",
+  ".text",
+  ".pdf",
+  ".docx",
+  ".doc",
+  ".jpg",
+  ".jpeg",
+  ".eml",
+  ".html",
+  ".htm",
+  ".md",
+  ".pptx",
+  ".ppt",
+  ".msg",
+  ".rtf",
+  ".xlsx",
+  ".xls",
+  ".odt",
+  ".epub",
+];
+
+/**
+ * Represents an element returned by the Unstructured API. It has
+ * properties for the element type, text content, and metadata.
+ */
+type Element = {
   type: string;
   text: string;
   // this is purposefully loosely typed
   metadata: {
     [key: string]: unknown;
   };
-}
+};
 
+/**
+ * Represents the available strategies for the UnstructuredLoader. It can
+ * be one of "hi_res", "fast", "ocr_only", or "auto".
+ */
+export type UnstructuredLoaderStrategy =
+  | "hi_res"
+  | "fast"
+  | "ocr_only"
+  | "auto";
+
+/**
+ * Represents a string value with autocomplete suggestions. It is used for
+ * the `strategy` property in the UnstructuredLoaderOptions.
+ */
+type StringWithAutocomplete<T> = T | (string & Record<never, never>);
+
+export type UnstructuredLoaderOptions = {
+  apiKey?: string;
+  apiUrl?: string;
+  strategy?: StringWithAutocomplete<UnstructuredLoaderStrategy>;
+  encoding?: string;
+  ocrLanguages?: Array<string>;
+  coordinates?: boolean;
+  pdfInferTableStructure?: boolean;
+  xmlKeepTags?: boolean;
+};
+
+type UnstructuredDirectoryLoaderOptions = UnstructuredLoaderOptions & {
+  recursive?: boolean;
+  unknown?: UnknownHandling;
+};
+
+/**
+ * A document loader that uses the Unstructured API to load unstructured
+ * documents. It supports both the new syntax with options object and the
+ * legacy syntax for backward compatibility. The load() method sends a
+ * partitioning request to the Unstructured API and retrieves the
+ * partitioned elements. It creates a Document instance for each element
+ * and returns an array of Document instances.
+ */
 export class UnstructuredLoader extends BaseDocumentLoader {
-  constructor(public webPath: string, public filePath: string) {
-    super();
-    this.filePath = filePath;
+  public filePath: string;
 
-    this.webPath = webPath;
+  private apiUrl = "https://api.unstructured.io/general/v0/general";
+
+  private apiKey?: string;
+
+  private strategy: StringWithAutocomplete<UnstructuredLoaderStrategy> =
+    "hi_res";
+
+  private encoding?: string;
+
+  private ocrLanguages: Array<string> = [];
+
+  private coordinates?: boolean;
+
+  private pdfInferTableStructure?: boolean;
+
+  private xmlKeepTags?: boolean;
+
+  constructor(
+    filePathOrLegacyApiUrl: string,
+    optionsOrLegacyFilePath: UnstructuredLoaderOptions | string = {}
+  ) {
+    super();
+
+    // Temporary shim to avoid breaking existing users
+    // Remove when API keys are enforced by Unstructured and existing code will break anyway
+    const isLegacySyntax = typeof optionsOrLegacyFilePath === "string";
+    if (isLegacySyntax) {
+      this.filePath = optionsOrLegacyFilePath;
+      this.apiUrl = filePathOrLegacyApiUrl;
+    } else {
+      this.filePath = filePathOrLegacyApiUrl;
+      const options = optionsOrLegacyFilePath;
+      this.apiKey = options.apiKey;
+      this.apiUrl = options.apiUrl ?? this.apiUrl;
+      this.strategy = options.strategy ?? this.strategy;
+      this.encoding = options.encoding;
+      this.ocrLanguages = options.ocrLanguages ?? this.ocrLanguages;
+      this.coordinates = options.coordinates;
+      this.pdfInferTableStructure = options.pdfInferTableStructure;
+      this.xmlKeepTags = options.xmlKeepTags;
+    }
   }
 
   async _partition() {
@@ -33,10 +141,31 @@ export class UnstructuredLoader extends BaseDocumentLoader {
     // worried about this for now.
     const formData = new FormData();
     formData.append("files", new Blob([buffer]), fileName);
+    formData.append("strategy", this.strategy);
+    this.ocrLanguages.forEach((language) => {
+      formData.append("ocr_languages", language);
+    });
+    if (this.encoding) {
+      formData.append("encoding", this.encoding);
+    }
+    if (this.coordinates === true) {
+      formData.append("coordinates", "true");
+    }
+    if (this.pdfInferTableStructure === true) {
+      formData.append("pdf_infer_table_structure", "true");
+    }
+    if (this.xmlKeepTags === true) {
+      formData.append("xml_keep_tags", "true");
+    }
 
-    const response = await fetch(this.webPath, {
+    const headers = {
+      "UNSTRUCTURED-API-KEY": this.apiKey ?? "",
+    };
+
+    const response = await fetch(this.apiUrl, {
       method: "POST",
       body: formData,
+      headers,
     });
 
     if (!response.ok) {
@@ -62,22 +191,24 @@ export class UnstructuredLoader extends BaseDocumentLoader {
     const documents: Document[] = [];
     for (const element of elements) {
       const { metadata, text } = element;
-      documents.push(
-        new Document({
-          pageContent: text,
-          metadata: {
-            ...metadata,
-            category: element.type,
-          },
-        })
-      );
+      if (typeof text === "string") {
+        documents.push(
+          new Document({
+            pageContent: text,
+            metadata: {
+              ...metadata,
+              category: element.type,
+            },
+          })
+        );
+      }
     }
 
     return documents;
   }
 
   async imports(): Promise<{
-    readFile: typeof ReaFileT;
+    readFile: typeof ReadFileT;
     basename: typeof BasenameT;
   }> {
     try {
@@ -93,29 +224,45 @@ export class UnstructuredLoader extends BaseDocumentLoader {
   }
 }
 
+/**
+ * A document loader that loads unstructured documents from a directory
+ * using the UnstructuredLoader. It creates a UnstructuredLoader instance
+ * for each supported file type and passes it to the DirectoryLoader
+ * constructor.
+ */
 export class UnstructuredDirectoryLoader extends DirectoryLoader {
   constructor(
-    public webPath: string,
-    public directoryPath: string,
-    public recursive: boolean = true,
-    public unknown: UnknownHandling = UnknownHandling.Warn
+    directoryPathOrLegacyApiUrl: string,
+    optionsOrLegacyDirectoryPath: UnstructuredDirectoryLoaderOptions | string,
+    legacyOptionRecursive = true,
+    legacyOptionUnknown: UnknownHandling = UnknownHandling.Warn
   ) {
-    const loaders = {
-      ".txt": (p: string) => new UnstructuredLoader(webPath, p),
-      ".text": (p: string) => new UnstructuredLoader(webPath, p),
-      ".pdf": (p: string) => new UnstructuredLoader(webPath, p),
-      ".docx": (p: string) => new UnstructuredLoader(webPath, p),
-      ".doc": (p: string) => new UnstructuredLoader(webPath, p),
-      ".jpg": (p: string) => new UnstructuredLoader(webPath, p),
-      ".jpeg": (p: string) => new UnstructuredLoader(webPath, p),
-      ".eml": (p: string) => new UnstructuredLoader(webPath, p),
-      ".html": (p: string) => new UnstructuredLoader(webPath, p),
-      ".md": (p: string) => new UnstructuredLoader(webPath, p),
-      ".pptx": (p: string) => new UnstructuredLoader(webPath, p),
-      ".ppt": (p: string) => new UnstructuredLoader(webPath, p),
-      ".msg": (p: string) => new UnstructuredLoader(webPath, p),
-    };
-    super(directoryPath, loaders, recursive, unknown);
+    let directoryPath;
+    let options: UnstructuredDirectoryLoaderOptions;
+    // Temporary shim to avoid breaking existing users
+    // Remove when API keys are enforced by Unstructured and existing code will break anyway
+    const isLegacySyntax = typeof optionsOrLegacyDirectoryPath === "string";
+    if (isLegacySyntax) {
+      directoryPath = optionsOrLegacyDirectoryPath;
+      options = {
+        apiUrl: directoryPathOrLegacyApiUrl,
+        recursive: legacyOptionRecursive,
+        unknown: legacyOptionUnknown,
+      };
+    } else {
+      directoryPath = directoryPathOrLegacyApiUrl;
+      options = optionsOrLegacyDirectoryPath;
+    }
+    const loader = (p: string) => new UnstructuredLoader(p, options);
+    const loaders = UNSTRUCTURED_API_FILETYPES.reduce(
+      (loadersObject: LoadersMapping, filetype: string) => {
+        // eslint-disable-next-line no-param-reassign
+        loadersObject[filetype] = loader;
+        return loadersObject;
+      },
+      {}
+    );
+    super(directoryPath, loaders, options.recursive, options.unknown);
   }
 }
 

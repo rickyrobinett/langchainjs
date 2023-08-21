@@ -1,9 +1,7 @@
 import { test, expect, afterAll, beforeAll } from "@jest/globals";
-import { ErrorCode } from "@zilliz/milvus2-sdk-node/dist/milvus/types.js";
-import { MilvusClient } from "@zilliz/milvus2-sdk-node/dist/milvus/index.js";
-
+import { ErrorCode, MilvusClient } from "@zilliz/milvus2-sdk-node";
 import { Milvus } from "../milvus.js";
-import { OpenAIEmbeddings } from "../../embeddings/index.js";
+import { OpenAIEmbeddings } from "../../embeddings/openai.js";
 
 let collectionName: string;
 let embeddings: OpenAIEmbeddings;
@@ -15,13 +13,13 @@ beforeAll(async () => {
 
 test.skip("Test Milvus.fromtext", async () => {
   const texts = [
-    `Tortoise: Labyrinth? Labyrinth? Could it Are we in the notorious Little 
+    `Tortoise: Labyrinth? Labyrinth? Could it Are we in the notorious Little
 Harmonic Labyrinth of the dreaded Majotaur?`,
     "Achilles: Yiikes! What is that?",
-    `Tortoise: They say-although I person never believed it myself-that an I 
-    Majotaur has created a tiny labyrinth sits in a pit in the middle of 
-    it, waiting innocent victims to get lost in its fears complexity. 
-    Then, when they wander and dazed into the center, he laughs and 
+    `Tortoise: They say-although I person never believed it myself-that an I
+    Majotaur has created a tiny labyrinth sits in a pit in the middle of
+    it, waiting innocent victims to get lost in its fears complexity.
+    Then, when they wander and dazed into the center, he laughs and
     laughs at them-so hard, that he laughs them to death!`,
     "Achilles: Oh, no!",
     "Tortoise: But it's only a myth. Courage, Achilles.",
@@ -51,6 +49,10 @@ Harmonic Labyrinth of the dreaded Majotaur?`,
     { id: 4, other: objB },
     { id: 5, other: objA },
   ]);
+
+  const resultThree = await milvus.similaritySearch(query, 1, "id == 1");
+  const resultThreeMetadatas = resultThree.map(({ metadata }) => metadata);
+  expect(resultThreeMetadatas).toEqual([{ id: 1, other: objB }]);
 });
 
 test.skip("Test Milvus.fromExistingCollection", async () => {
@@ -70,6 +72,30 @@ test.skip("Test Milvus.fromExistingCollection", async () => {
   expect(resultTwoMetadatas[0].id).toEqual(1);
   expect(resultTwoMetadatas[1].id).toEqual(4);
   expect(resultTwoMetadatas[2].id).toEqual(5);
+
+  const resultThree = await milvus.similaritySearch(query, 1, "id == 1");
+  const resultThreeMetadatas = resultThree.map(({ metadata }) => metadata);
+  expect(resultThreeMetadatas.length).toBe(1);
+  expect(resultThreeMetadatas[0].id).toEqual(1);
+});
+
+test.skip("Test Milvus.deleteData", async () => {
+  const milvus = await Milvus.fromExistingCollection(embeddings, {
+    collectionName,
+  });
+
+  const query = "who is achilles?";
+  const result = await milvus.similaritySearch(query, 1);
+  const resultMetadatas = result.map(({ metadata }) => metadata);
+  const primaryId = resultMetadatas[0].langchain_primaryid;
+  expect(resultMetadatas.length).toBe(1);
+  expect(resultMetadatas[0].id).toEqual(1);
+
+  await milvus.delete({ filter: `langchain_primaryid in [${primaryId}]` });
+
+  const resultTwo = await milvus.similaritySearch(query, 1);
+  const resultTwoMetadatas = resultTwo.map(({ metadata }) => metadata);
+  expect(resultTwoMetadatas[0].id).not.toEqual(1);
 });
 
 afterAll(async () => {
@@ -77,7 +103,7 @@ afterAll(async () => {
   if (!process.env.MILVUS_URL) return;
   // eslint-disable-next-line no-process-env
   const client = new MilvusClient(process.env.MILVUS_URL as string);
-  const dropRes = await client.collectionManager.dropCollection({
+  const dropRes = await client.dropCollection({
     collection_name: collectionName,
   });
   // console.log("Drop collection response: ", dropRes)
